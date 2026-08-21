@@ -88,7 +88,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── app/db/                # Schema definitions, seed data, lazy-init logic (Python package, alongside app/market/)
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -110,7 +110,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/app/db/`** is a Python package (matching the `backend/app/market/` convention) containing schema definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty. Distinct from the top-level `db/` below — don't confuse the two.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -195,7 +195,7 @@ The backend checks for the SQLite database on startup (or first request). If the
 
 All tables include a `user_id` column defaulting to `"default"`. This is hardcoded for now (single-user) but enables future multi-user support without schema migration.
 
-**users_profile** — User state (cash balance)
+**users** — User state (cash balance)
 - `id` TEXT PRIMARY KEY (default: `"default"`)
 - `cash_balance` REAL (default: `10000.0`)
 - `created_at` TEXT (ISO timestamp)
@@ -241,7 +241,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ### Default Seed Data
 
-- One user profile: `id="default"`, `cash_balance=10000.0`
+- One user row (in `users`): `id="default"`, `cash_balance=10000.0`
 - Ten watchlist entries: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX
 
 ---
@@ -364,7 +364,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- **Lightweight Charts** (canvas-based) for all charts, including the main chart, sparklines, and P&L chart — chosen for performance under fast-ticking updates (see §13 resolution)
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
@@ -463,30 +463,30 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### Questions / Clarifications
 
-1. **Chat message/trade consistency (§9)** — `message` and `trades` are produced in a single LLM completion, but trade *validation* happens afterward. If a proposed trade fails validation (insufficient cash), the `message` text may already say "I bought 10 AAPL for you" even though the trade didn't execute. Should the flow either (a) validate before generating the final message, or (b) have the LLM see execution results and produce `message` in a second pass? Right now §9 step 6 says errors are "included in the chat response," but it's not clear whether that means appended to the LLM's own message or how a mismatch between claimed and actual outcome is avoided.
+1. ~~**Chat message/trade consistency (§9)**~~ — Resolved: single LLM completion produces `message` + proposed `trades`/`watchlist_changes`, as before. The backend validates and executes each proposed trade *after* the completion; for any that fail validation, it appends a short factual note to the returned `message` string (e.g. "Note: AAPL buy failed — insufficient cash"). No second LLM pass.
 
-2. **`actions` column semantics (§7, `chat_messages`)** — Is `actions` the raw trades/watchlist_changes the LLM *proposed*, or the actual *executed* result (including which ones failed validation)? Worth stating explicitly, since it's the audit trail for what really happened vs. what the LLM asked for.
+2. ~~**`actions` column semantics (§7, `chat_messages`)**~~ — Resolved: `actions` stores the actual *executed* outcome — each proposed trade/watchlist change plus its result (executed, or failed with reason) — not the raw LLM proposal.
 
-3. **Conversation history window (§9, step 2)** — "Loads recent conversation history" doesn't say how much (last N messages? last N turns? token budget?). Since `chat_messages` grows unbounded in a single long-running demo session, an explicit window avoids unbounded prompt growth.
+3. ~~**Conversation history window (§9, step 2)**~~ — Resolved: the backend loads the last 20 rows from `chat_messages` (~10 turns) as history for the prompt.
 
-4. **Watchlist ↔ market data source wiring (§8 vs §6)** — The market data interface already exposes `add_ticker`/`remove_ticker` (per `MARKET_DATA_SUMMARY.md`), but §8's `POST /api/watchlist` / `DELETE /api/watchlist/{ticker}` don't say they call these. Worth an explicit line: watchlist CRUD is the trigger that adds/removes tickers from the live price cache.
+4. ~~**Watchlist ↔ market data source wiring (§8 vs §6)**~~ — Resolved: `POST /api/watchlist` calls `source.add_ticker(ticker)` and `DELETE /api/watchlist/{ticker}` calls `source.remove_ticker(ticker)` on the shared market data source (subject to the rule in #5 below).
 
-5. **Removing a watchlist ticker you hold a position in** — Nothing in §6 or §8 addresses this. If a ticker is removed from the watchlist but a `positions` row still references it, does it stay in the price cache anyway (so portfolio valuation still works), or does valuation fall back to last-known price? Worth a one-line rule, e.g., "the price cache always includes watchlist tickers *and* tickers with open positions."
+5. ~~**Removing a watchlist ticker you hold a position in**~~ — Resolved: the price cache always covers the union of watchlist tickers *and* tickers with an open position. Removing a ticker from the watchlist while a position remains open skips `source.remove_ticker` (the ticker stays live in the cache) until the position is fully closed, at which point it's removed.
 
-6. **Unknown-ticker handling isn't documented** — The simulator already falls back gracefully for tickers outside `SEED_PRICES`/`TICKER_PARAMS` (random seed price, default drift/vol — see `seed_prices.py` `DEFAULT_PARAMS`). PLAN.md doesn't mention this, but it directly answers "what happens when the user or the LLM adds a ticker like `PYPL`" (the very example used in §9's schema). Worth a line in §6 so it's documented as intended behavior, not an implementation accident.
+6. ~~**Unknown-ticker handling isn't documented**~~ — Resolved: this is already the simulator's real behavior (random seed price + default drift/vol via `seed_prices.py` `DEFAULT_PARAMS`) — documented here as intended, not an implementation accident. No code change needed.
 
-7. **Massive API poll interval by tier (§6)** — "Free tier: 15s, paid tiers: 2-15s depending on tier" implies the backend knows which tier the key belongs to. How is tier determined — a config env var, or a fixed conservative default? Auto-detecting tier from the API isn't generally possible without extra calls, so this probably needs an explicit `MASSIVE_POLL_INTERVAL` env var (or similar) rather than automatic tier inference.
+7. ~~**Massive API poll interval by tier (§6)**~~ — Resolved: no tier auto-detection. `MassiveDataSource` already accepts a `poll_interval` constructor param (default 15s); `create_market_data_source` reads an optional `MASSIVE_POLL_INTERVAL_SECONDS` env var (falling back to 15) and passes it through.
 
 8. ~~**Docker volume: bind mount vs named volume contradiction (§4 vs §11)**~~ — Resolved: §11 now uses a bind mount (`-v "$(pwd)/db:/app/db"`), consistent with §4.
 
-9. **Single worker process isn't stated explicitly (§3, §7)** — The in-memory price cache and the GBM simulator's `asyncio` background task both assume a single process. SQLite also doesn't handle multi-process concurrent writers well. Worth an explicit note in §11 (Dockerfile/CMD) that uvicorn must run with a single worker (no `--workers N`), since it's load-bearing for correctness, not just a performance choice.
+9. ~~**Single worker process isn't stated explicitly (§3, §7)**~~ — Resolved: uvicorn MUST run with a single worker (no `--workers N`) in the Dockerfile `CMD`. The in-memory price cache and the GBM simulator's `asyncio` background task assume a single process, and SQLite doesn't handle concurrent multi-process writers well — this is load-bearing for correctness, not a performance tuning choice.
 
 10. ~~**`cerebras-inference` skill name (§9)`**~~ — Resolved: §9 now references the `cerebras` skill, matching `.claude/skills/`.
 
-11. **EventSource has no native "reconnecting" state (§2, §10)** — The connection status indicator wants three states (green/yellow/red = connected/reconnecting/disconnected), but the browser `EventSource` API only exposes `CONNECTING`/`OPEN`/`CLOSED` and fires `onerror` on drops — it doesn't distinguish "actively retrying" from "gave up." Worth noting that the frontend will need its own small state machine (e.g., treat the state between an `onerror` and the next `onopen` as "reconnecting") rather than reading a "reconnecting" state directly off the API.
+11. ~~**EventSource has no native "reconnecting" state (§2, §10)**~~ — Resolved: the frontend keeps its own small connection-state machine on top of `EventSource` (CONNECTING/OPEN natively; the window between an `onerror` and the next `onopen` is treated as "reconnecting") since the browser API doesn't expose a distinct retrying state.
 
 ### Simplification Opportunities
 
-- **§10 charting library**: "Canvas-based charting library preferred (Lightweight Charts or Recharts)" is internally inconsistent — Lightweight Charts renders to `<canvas>`, but Recharts is SVG-based. Since the two aren't interchangeable on the stated criterion, picking one now (rather than leaving both as options) avoids the Frontend Engineer agent having to make an unguided call that affects performance with fast-ticking sparklines.
-- **`docker-compose.yml` vs `scripts/start_mac.sh` (§4, §11)**: both appear to do the same job (run the single container with volume + port + env-file). If compose is only meant for local convenience, say so explicitly; otherwise consider dropping one to avoid two scripts that can drift out of sync.
-- **`users_profile` naming (§7)**: every other table is plural (`positions`, `trades`, `portfolio_snapshots`, `chat_messages`) except `users_profile` (and singular `watchlist`). Minor, but a quick rename pass would keep the schema self-consistent — not worth a special trip, just worth doing if the schema is touched anyway.
+- ~~**§10 charting library**~~ — Resolved: **Lightweight Charts** (genuinely canvas-based) is used for all charts — main chart, watchlist sparklines, and P&L chart. Recharts (SVG-based) dropped from consideration.
+- ~~**`docker-compose.yml` vs `scripts/start_mac.sh` (§4, §11)`**~~ — Resolved: `docker-compose.yml` is kept explicitly as a local-dev convenience wrapper around the same single-container run described in §11 (same volume mount, port, and env-file) — not a second, divergent deployment path.
+- ~~**`users_profile` naming (§7)**~~ — Resolved: renamed to `users` (§7) for consistency with the other table names, done now while the schema is first being built.

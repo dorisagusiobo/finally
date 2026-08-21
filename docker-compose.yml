@@ -1,0 +1,16 @@
+# Local-dev convenience wrapper only — NOT a second deployment path.
+# This runs the exact same single container described in planning/PLAN.md §11
+# (same image, same volume mount, same port, same env file). If you change how
+# the container is run here, make the equivalent change to scripts/start_mac.sh
+# / scripts/start_windows.ps1 (and vice versa) so the two don't drift apart.
+
+services:
+  finally:
+    build: .
+    image: finally
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./db:/app/db
+    env_file:
+      - .env

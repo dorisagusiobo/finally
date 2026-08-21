@@ -1,0 +1,52 @@
+# E2E test infrastructure (PLAN.md §12). Builds the real production image
+# from the root Dockerfile and runs the Playwright suite against it in a
+# separate container, keeping browser dependencies out of the production
+# image. The app runs with LLM_MOCK=true and an ephemeral, anonymous-volume
+# database — never the real bind-mounted db/finally.db.
+#
+# Run from the repo root:
+#   docker compose -f test/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from playwright
+#   docker compose -f test/docker-compose.test.yml down -v
+
+services:
+  finally-test:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: finally:test
+    environment:
+      LLM_MOCK: "true"
+      OPENROUTER_API_KEY: "test-dummy-key"
+      MASSIVE_API_KEY: ""
+    volumes:
+      - finally_test_db:/app/db
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.49.1-jammy
+    working_dir: /work
+    volumes:
+      - ./:/work
+    environment:
+      PLAYWRIGHT_BASE_URL: "http://finally-test:8000"
+      CI: "true"
+    depends_on:
+      finally-test:
+        condition: service_healthy
+    command: sh -c "npm install && npx playwright test"
+
+volumes:
+  finally_test_db:

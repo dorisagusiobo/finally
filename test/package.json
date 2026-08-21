@@ -1,0 +1,12 @@
+{
+  "name": "finally-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright E2E suite for FinAlly (PLAN.md §12), run against a real built container.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.49.1"
+  }
+}

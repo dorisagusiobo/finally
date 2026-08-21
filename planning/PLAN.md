@@ -281,7 +281,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use the cerebras skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
 
 There is an OPENROUTER_API_KEY in the .env file in the project root.
 
@@ -292,7 +292,7 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads recent conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras skill
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
@@ -393,10 +393,10 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 
 ### Docker Volume
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a bind mount to the project's `db/` directory, so the SQLite file is directly visible/inspectable on the host:
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v "$(pwd)/db:/app/db" -p 8000:8000 --env-file .env finally
 ```
 
 The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
@@ -454,3 +454,39 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Doc Review — Questions, Clarifications & Simplification Opportunities
+
+*(Added 2026-08-20. The market data subsystem, §6, is already built — see `planning/MARKET_DATA_SUMMARY.md`. Findings below are cross-checked against that implementation where relevant.)*
+
+### Questions / Clarifications
+
+1. **Chat message/trade consistency (§9)** — `message` and `trades` are produced in a single LLM completion, but trade *validation* happens afterward. If a proposed trade fails validation (insufficient cash), the `message` text may already say "I bought 10 AAPL for you" even though the trade didn't execute. Should the flow either (a) validate before generating the final message, or (b) have the LLM see execution results and produce `message` in a second pass? Right now §9 step 6 says errors are "included in the chat response," but it's not clear whether that means appended to the LLM's own message or how a mismatch between claimed and actual outcome is avoided.
+
+2. **`actions` column semantics (§7, `chat_messages`)** — Is `actions` the raw trades/watchlist_changes the LLM *proposed*, or the actual *executed* result (including which ones failed validation)? Worth stating explicitly, since it's the audit trail for what really happened vs. what the LLM asked for.
+
+3. **Conversation history window (§9, step 2)** — "Loads recent conversation history" doesn't say how much (last N messages? last N turns? token budget?). Since `chat_messages` grows unbounded in a single long-running demo session, an explicit window avoids unbounded prompt growth.
+
+4. **Watchlist ↔ market data source wiring (§8 vs §6)** — The market data interface already exposes `add_ticker`/`remove_ticker` (per `MARKET_DATA_SUMMARY.md`), but §8's `POST /api/watchlist` / `DELETE /api/watchlist/{ticker}` don't say they call these. Worth an explicit line: watchlist CRUD is the trigger that adds/removes tickers from the live price cache.
+
+5. **Removing a watchlist ticker you hold a position in** — Nothing in §6 or §8 addresses this. If a ticker is removed from the watchlist but a `positions` row still references it, does it stay in the price cache anyway (so portfolio valuation still works), or does valuation fall back to last-known price? Worth a one-line rule, e.g., "the price cache always includes watchlist tickers *and* tickers with open positions."
+
+6. **Unknown-ticker handling isn't documented** — The simulator already falls back gracefully for tickers outside `SEED_PRICES`/`TICKER_PARAMS` (random seed price, default drift/vol — see `seed_prices.py` `DEFAULT_PARAMS`). PLAN.md doesn't mention this, but it directly answers "what happens when the user or the LLM adds a ticker like `PYPL`" (the very example used in §9's schema). Worth a line in §6 so it's documented as intended behavior, not an implementation accident.
+
+7. **Massive API poll interval by tier (§6)** — "Free tier: 15s, paid tiers: 2-15s depending on tier" implies the backend knows which tier the key belongs to. How is tier determined — a config env var, or a fixed conservative default? Auto-detecting tier from the API isn't generally possible without extra calls, so this probably needs an explicit `MASSIVE_POLL_INTERVAL` env var (or similar) rather than automatic tier inference.
+
+8. ~~**Docker volume: bind mount vs named volume contradiction (§4 vs §11)**~~ — Resolved: §11 now uses a bind mount (`-v "$(pwd)/db:/app/db"`), consistent with §4.
+
+9. **Single worker process isn't stated explicitly (§3, §7)** — The in-memory price cache and the GBM simulator's `asyncio` background task both assume a single process. SQLite also doesn't handle multi-process concurrent writers well. Worth an explicit note in §11 (Dockerfile/CMD) that uvicorn must run with a single worker (no `--workers N`), since it's load-bearing for correctness, not just a performance choice.
+
+10. ~~**`cerebras-inference` skill name (§9)`**~~ — Resolved: §9 now references the `cerebras` skill, matching `.claude/skills/`.
+
+11. **EventSource has no native "reconnecting" state (§2, §10)** — The connection status indicator wants three states (green/yellow/red = connected/reconnecting/disconnected), but the browser `EventSource` API only exposes `CONNECTING`/`OPEN`/`CLOSED` and fires `onerror` on drops — it doesn't distinguish "actively retrying" from "gave up." Worth noting that the frontend will need its own small state machine (e.g., treat the state between an `onerror` and the next `onopen` as "reconnecting") rather than reading a "reconnecting" state directly off the API.
+
+### Simplification Opportunities
+
+- **§10 charting library**: "Canvas-based charting library preferred (Lightweight Charts or Recharts)" is internally inconsistent — Lightweight Charts renders to `<canvas>`, but Recharts is SVG-based. Since the two aren't interchangeable on the stated criterion, picking one now (rather than leaving both as options) avoids the Frontend Engineer agent having to make an unguided call that affects performance with fast-ticking sparklines.
+- **`docker-compose.yml` vs `scripts/start_mac.sh` (§4, §11)**: both appear to do the same job (run the single container with volume + port + env-file). If compose is only meant for local convenience, say so explicitly; otherwise consider dropping one to avoid two scripts that can drift out of sync.
+- **`users_profile` naming (§7)**: every other table is plural (`positions`, `trades`, `portfolio_snapshots`, `chat_messages`) except `users_profile` (and singular `watchlist`). Minor, but a quick rename pass would keep the schema self-consistent — not worth a special trip, just worth doing if the schema is touched anyway.
